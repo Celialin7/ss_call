@@ -17,7 +17,7 @@ Configuration:
 Features:
 - Analyzes uniqueness of terms across all required discussion points
 - Generates dynamic term importance weights based on rarity and theme relevance
-- Keeps top 12 words with highest uniqueness score per discussion point
+- Uses dynamic top-N words per discussion point (15% of unique tokens, min 2, max 16)
 - Exports to CSV.gz format for lazy loading by dictionaries.py
 - Supports multi-language processing (CAN/MAN/ENG)
 - Always generates fresh results for each run
@@ -27,6 +27,7 @@ Features:
 
 import pandas as pd
 import numpy as np
+import math
 import re
 import pycantonese as pc
 import jieba
@@ -72,6 +73,11 @@ USE_BATCH_MODE = True  # Set to True for multi-product batch processing, False f
 DEFAULT_SHEET_NAME = 'Script'  # Default sheet name for single sheet mode
 DEFAULT_LANGUAGE = 'CAN'  # Default language for single sheet mode: 'CAN', 'MAN', or 'ENG'
 # Note: Analysis always runs fresh - no caching
+
+# Dynamic top-N configuration for point-level term selection
+TOP_TERMS_RATIO = 0.15
+TOP_TERMS_MIN = 2
+TOP_TERMS_MAX = 16
 
 def sanitize_string_for_dict_key(text):
     """
@@ -410,7 +416,8 @@ def analyze_script_uniqueness(required_points_df, language='CAN'):
     Analyze uniqueness at the Required_Discussion_Point level with language-specific processing.
     - Aggregate all Standard_Script rows per point into a single point-level token set
     - Compute document frequency across points (not rows)
-    - For each point, keep top 12 tokens by uniqueness score
+    - For each point, keep dynamic top-N tokens by uniqueness score
+      (N = ceil(unique_tokens * 15%), bounded by [2, 16])
     - Use appropriate tokenization strategy based on target language and model
     
     Args:
@@ -463,12 +470,19 @@ def analyze_script_uniqueness(required_points_df, language='CAN'):
         # Rank tokens for this point by global uniqueness score
         scored = [(t, token_to_score.get(t, 0.0)) for t in tokens]
         scored.sort(key=lambda x: x[1], reverse=True)
-        top_12 = scored[:12]
-        print(f"\nPoint: {point} | Selected {len(top_12)} terms")
+        unique_token_count = len(tokens)
+        dynamic_top_n = math.ceil(unique_token_count * TOP_TERMS_RATIO)
+        dynamic_top_n = max(TOP_TERMS_MIN, min(dynamic_top_n, TOP_TERMS_MAX))
+        top_terms = scored[:dynamic_top_n]
+        print(
+            f"\nPoint: {point} | Selected {len(top_terms)} terms "
+            f"(unique_tokens={unique_token_count}, ratio={TOP_TERMS_RATIO:.0%}, "
+            f"min={TOP_TERMS_MIN}, max={TOP_TERMS_MAX})"
+        )
         
         # Store point-specific weights
         point_weights = {}
-        for t, s in top_12:
+        for t, s in top_terms:
             print(f"  {t}: {s:.3f}")
             point_weights[t] = s
         
