@@ -46,8 +46,8 @@ import time
 # =============================
 # Project Path Setup
 # =============================
-# Add project root directory to path (unified approach)
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Project root = folder containing this file (flat layout: all .py in one directory)
+project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -368,6 +368,36 @@ class SbertCallCoverageChecker:
         if len(self._preprocess_cache) < 5000:
             self._preprocess_cache[text] = result
         return result
+
+    def normalize_script_embedding_keys(self):
+        """
+        Normalize precomputed script embedding keys to comparison-mode clean text.
+        This makes embedding cache lookup robust against irrelevant raw-text differences.
+        """
+        if not self.script_embeddings:
+            self.script_embeddings = {}
+            return 0, 0, 0
+
+        if not isinstance(self.script_embeddings, dict):
+            print("⚠️  Invalid script embeddings format, falling back to empty dict")
+            self.script_embeddings = {}
+            return 0, 0, 0
+
+        original_count = len(self.script_embeddings)
+        normalized = {}
+        collisions = 0
+
+        for raw_key, embedding in self.script_embeddings.items():
+            clean_key = self.preprocess_text(raw_key, mode='comparison', text_type='script')
+            if not clean_key:
+                continue
+            if clean_key in normalized:
+                collisions += 1
+                continue
+            normalized[clean_key] = embedding
+
+        self.script_embeddings = normalized
+        return original_count, len(normalized), collisions
     
     def _expand_keywords_memo(self, clean_text):
         """关键词扩展缓存版本，避免重复扩展"""
@@ -517,10 +547,10 @@ class SbertCallCoverageChecker:
             except Exception as e:
                 print(f"⚠️  Error loading {self.current_language} stopwords: {e}")
                 print(f"⚠️  Using default Mandarin stopwords")
-                self.stopwords = dictionaries.mandarin_stopwords
+                self.stopwords = dictionaries.get_stopwords('MAN')
         else:
             # Default to Mandarin for this version
-            self.stopwords = dictionaries.mandarin_stopwords
+            self.stopwords = dictionaries.get_stopwords('MAN')
         
         # 3. Detect product type from script
         self.current_product = self.detect_product_type_from_script(script_df, script_sheet_name)
@@ -1005,14 +1035,14 @@ class SbertCallCoverageChecker:
         Returns:
             dict: Dictionary containing all individual metrics and the final weighted score
         """
-        # Use cache to avoid re-computing for the same text pair
-        cache_key = (text1, text2)
-        if cache_key in self._similarity_cache:
-            return self._similarity_cache[cache_key]
-
         # 改动点1: 使用缓存版本避免重复预处理
         clean1 = self._preprocess_memo(text1)
         clean2 = self._preprocess_memo(text2)
+
+        # Use cache to avoid re-computing for semantically identical pairs
+        cache_key = (clean1, clean2)
+        if cache_key in self._similarity_cache:
+            return self._similarity_cache[cache_key]
         metrics = {}
         
         # 1. SBERT Semantic Score (Optimized with precomputed embeddings)
@@ -1021,13 +1051,13 @@ class SbertCallCoverageChecker:
             embedding1 = None
             embedding2 = None
             
-            # Check for script embedding (text1 should be script text)
-            if self.script_embeddings and text1 in self.script_embeddings:
-                embedding1 = self.script_embeddings[text1]
+            # Check for script embedding (normalized clean-text key)
+            if self.script_embeddings and clean1 in self.script_embeddings:
+                embedding1 = self.script_embeddings[clean1]
             
-            # Check for call text embedding (text2 should be call text)
-            if group_text_to_embedding and text2 in group_text_to_embedding:
-                embedding2 = group_text_to_embedding[text2]
+            # Check for call text embedding (normalized clean-text key)
+            if group_text_to_embedding and clean2 in group_text_to_embedding:
+                embedding2 = group_text_to_embedding[clean2]
             
             # Fall back to on-demand encoding if needed
             if embedding1 is None and embedding2 is None:
@@ -1358,7 +1388,7 @@ class SbertCallCoverageChecker:
             required_points_df: DataFrame with required discussion points and scripts
             grouped_lines: List of grouped call text segments
             threshold: Minimum similarity score to consider a point "covered"
-            group_text_to_embedding: Dict mapping call text to precomputed embeddings (optional)
+            group_text_to_embedding: Dict mapping preprocessed call text to precomputed embeddings (optional)
             
         Returns:
             pd.DataFrame: Coverage analysis results（保持原有返回结构与列顺序）
@@ -1616,7 +1646,7 @@ class SbertCallCoverageChecker:
             grouped_lines: List of grouped call text segments
             script_df: DataFrame with script data
             threshold: Threshold for determining hits
-            group_text_to_embedding: Dict mapping call text to precomputed embeddings (optional)
+            group_text_to_embedding: Dict mapping preprocessed call text to precomputed embeddings (optional)
             
         Returns:
             pd.DataFrame: Analysis view with columns for each discussion point（保持原有返回结构与列顺序）
@@ -1692,7 +1722,7 @@ class SbertCallCoverageChecker:
             system_audio_df: DataFrame with system recording rows
             script_df: DataFrame with script data
             threshold: Threshold for determining hits
-            group_text_to_embedding: Dict mapping call text to precomputed embeddings (optional)
+            group_text_to_embedding: Dict mapping preprocessed call text to precomputed embeddings (optional)
         """
         # 调用核心计算函数，获取所有配对结果（复用与其他报告函数相同的计算）
         pairwise_df = self.compute_pairwise_matches(
@@ -2096,9 +2126,9 @@ def generate_executive_summary_report(results_df, updated_call_df, script_df, gr
     business_friendly_columns = [
         'Required_Discussion_Point',
         'Standard_Script',
+        'Covered',
         'Matched_Group (Call Text)',
         'Speaker',
-        'Covered',
         'Overlapping_Keywords',
         'Group_ID',
         'All_Variations_Count'
@@ -2355,6 +2385,11 @@ def run_analysis(call_file_path, script_file_path, script_sheet_name, output_fol
     
     # 设置checker的语言
     checker.current_language = language
+
+    # Normalize script embedding keys to clean-text keys for robust cache hit
+    loaded_count, normalized_count, collisions = checker.normalize_script_embedding_keys()
+    if loaded_count > 0:
+        print(f"✅ Normalized script embedding keys: {loaded_count} -> {normalized_count} (collisions: {collisions})")
     
     # Load call-specific weights for all call types (unified processing)
     # This function is intelligent enough to handle both Sales Call and SQCCB based on script_sheet_name
@@ -2386,18 +2421,16 @@ def run_analysis(call_file_path, script_file_path, script_sheet_name, output_fol
     # Batch encode all grouped call texts for SBERT optimization
     print(f"🔄 批量编码通话文本...")
     
-    # Create mapping from original to preprocessed call texts
-    original_to_preprocessed_call = {}
+    # Build unique clean call texts (clean text is both SBERT input and embedding key)
     unique_preprocessed_call_texts = []
+    seen_preprocessed_call_texts = set()
     
     for group in grouped_lines:
         if group.get('text'):
-            original_text = group['text']
-            preprocessed_text = checker.preprocess_text(original_text, mode='comparison')
-            # Always add to mapping, even if preprocessed text is empty
-            original_to_preprocessed_call[original_text] = preprocessed_text
-            if preprocessed_text and preprocessed_text not in unique_preprocessed_call_texts:
+            preprocessed_text = checker.preprocess_text(group['text'], mode='comparison')
+            if preprocessed_text and preprocessed_text not in seen_preprocessed_call_texts:
                 unique_preprocessed_call_texts.append(preprocessed_text)
+                seen_preprocessed_call_texts.add(preprocessed_text)
     
     if unique_preprocessed_call_texts:
         try:
@@ -2409,11 +2442,8 @@ def run_analysis(call_file_path, script_file_path, script_sheet_name, output_fol
             for text, embedding in zip(unique_preprocessed_call_texts, group_embeddings):
                 preprocessed_to_embedding[text] = embedding
             
-            # Create final mapping: original text -> embedding of preprocessed text
-            group_text_to_embedding = {}
-            for original_text, preprocessed_text in original_to_preprocessed_call.items():
-                if preprocessed_text in preprocessed_to_embedding:
-                    group_text_to_embedding[original_text] = preprocessed_to_embedding[preprocessed_text]
+            # Final mapping: clean_text -> embedding (same key semantics as similarity lookup)
+            group_text_to_embedding = preprocessed_to_embedding
             
             print(f"✅ 批量编码完成: {len(group_text_to_embedding)} 个向量")
         except Exception as e:
