@@ -1804,9 +1804,9 @@ def generate_executive_summary_report(results_df, updated_call_df, script_df, gr
     business_friendly_columns = [
         'Required_Discussion_Point',
         'Standard_Script',
+        'Covered',
         'Matched_Group (Call Text)',
         'Speaker',
-        'Covered',
         'Overlapping_Keywords',
         'Group_ID',
         'All_Variations_Count'
