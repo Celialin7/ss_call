@@ -126,6 +126,39 @@ def parse_filename_for_task_info(filename, mapping_df):
     Returns:
         dict: 包含sample_no, language, product_name, call_type的字典，失败返回None
     """
+    def normalize_call_type(value):
+        """Normalize call type labels for robust matching."""
+        if pd.isna(value):
+            return ""
+        text = str(value).strip().lower()
+        if text in {"sqccb", "sqc cb"}:
+            return "sqccb"
+        if text in {"sales leader confirmation", "salesleader confirmation", "salesleader", "saleleader", "sales leader"}:
+            return "sales leader confirmation"
+        if text in {"sales call", "salescall", "sales"}:
+            return "sales call"
+        return text
+
+    def resolve_mapping_row(sample_no_value, call_type_value):
+        """
+        Resolve one mapping row using:
+        1) Sample No + Call Type (if 'Call Type' column exists)
+        2) Fallback to first row by Sample No
+        """
+        sample_matches = mapping_df[mapping_df['Sample No'].astype(str) == str(sample_no_value)]
+        if sample_matches.empty:
+            return None
+
+        if 'Call Type' in sample_matches.columns:
+            target_call_type = normalize_call_type(call_type_value)
+            typed_matches = sample_matches[
+                sample_matches['Call Type'].apply(normalize_call_type) == target_call_type
+            ]
+            if not typed_matches.empty:
+                return typed_matches.iloc[0]
+
+        return sample_matches.iloc[0]
+
     try:
         # 处理Excel文件名转换为CSV格式进行解析
         if filename.endswith('.xlsx'):
@@ -156,27 +189,52 @@ def parse_filename_for_task_info(filename, mapping_df):
             # 抛出明确错误，由外层捕获打印
             raise ValueError(f"Unsupported language suffix '{language_part}' in filename '{filename}'. Expected: C, M, or E")
         
-        # Check if this is a SQCCB file first (case-insensitive check)
-        filename_upper = filename.upper()
-        if 'SQCCB' in filename_upper:
-            # For SQCCB files, set product_name directly without mapping lookup
-            product_name = 'SQCCB'
+        # Detect call type from filename (case-insensitive; language suffix parsing is separate)
+        filename_lower = filename.lower()
+        if 'sqccb' in filename_lower:
             call_type = 'SQCCB'
+            product_name = 'SQCCB'
+        elif any(keyword in filename_lower for keyword in ['salesleader', 'sales leader', 'saleleader']):
+            call_type = 'Sales Leader Confirmation'
+            product_name = 'SalesLeader'
         else:
-            # For non-SQCCB files, look up product name in mapping
             call_type = 'Sales Call'
-            sample_no_matches = mapping_df[mapping_df['Sample No'].astype(str) == str(sample_no)]
-            if not sample_no_matches.empty:
-                product_name = sample_no_matches.iloc[0]['Product Name']
-            else:
-                return None
+            product_name = None
+
+        # Resolve mapping row using Sample No + Call Type (if available)
+        mapping_row = resolve_mapping_row(sample_no, call_type)
+
+        # Mapping is required to resolve sample-level product/call routing
+        if mapping_row is None:
+            return None
+
+        # Prefer product from mapping when available
+        if mapping_row is not None and 'Product Name' in mapping_row and pd.notna(mapping_row['Product Name']):
+            product_name = str(mapping_row['Product Name']).strip()
+
+        # Build script sheet by call type using Product Name where available
+        normalized_call_type = normalize_call_type(call_type)
+        if normalized_call_type == 'sqccb':
+            if not product_name or not product_name.lower().startswith('sqccb'):
+                product_name = 'SQCCB'
+        elif normalized_call_type == 'sales leader confirmation':
+            if not product_name or not (
+                product_name.lower().startswith('salesleader') or
+                product_name.lower().startswith('saleleader') or
+                product_name.lower().startswith('sales leader')
+            ):
+                product_name = 'SalesLeader'
+        elif not product_name:
+            return None
+
+        script_sheet = f"{product_name}_{language}"
         
         return {
             'sample_no': sample_no,
             'language': language,
             'product_name': product_name,
             'call_type': call_type,
-            'script_sheet': f"{product_name}_{language}"
+            'script_sheet': script_sheet
         }
         
     except ValueError as e:
@@ -297,25 +355,12 @@ def extract_data_from_multiple_sources_final(file_path, mapping_df):
     data = {
         'Sample No': task_info['sample_no'],
         'Language': task_info['language'],
-        'Call Type': task_info['call_type']
+        'Call Type': task_info['call_type'],
+        'Product Name': task_info['product_name']
     }
     
     # ========================================
-    # 2. 修复Product Name - 使用mapping查找
-    # ========================================
-    
-    sample_no = task_info['sample_no']
-    try:
-        sample_no_matches = mapping_df[mapping_df['Sample No'].astype(str) == str(sample_no)]
-        if not sample_no_matches.empty:
-            data['Product Name'] = sample_no_matches.iloc[0]['Product Name']
-        else:
-            return None, f"Sample No映射失败：Sample No '{sample_no}' 在mapping文件中不存在"
-    except Exception as e:
-        return None, f"Product Name查找出错：{str(e)}"
-    
-    # ========================================
-    # 3. 修复Executive Summary解析 - 正确的标签匹配
+    # 2. 修复Executive Summary解析 - 正确的标签匹配
     # ========================================
     
     try:
