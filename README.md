@@ -10,7 +10,7 @@ It reads transcript files, compares call content to required discussion points, 
 ## Quick mental model (30 seconds)
 - `run_batch_analysis.py` = the main orchestrator for real runs
 - `improved_call_coverage_checker.py` = Cantonese analyzer
-- `Mandarin/improved_call_coverage_checker_M.py` = Mandarin + SBERT analyzer (also supports ENG path)
+- `improved_call_coverage_checker_M.py` = Mandarin + SBERT analyzer (also supports ENG path); **与 `run_batch_analysis.py` 同目录**
 - `dynamic_script_analysis.py` = generates dynamic term weights and optional script embeddings
 - `config.py` = all important paths and run settings
 - `dictionaries.py` = synonyms, stopwords, term importance data loading
@@ -26,7 +26,7 @@ It reads transcript files, compares call content to required discussion points, 
 | `dictionaries.py` | Yes | Core lexical resources: synonyms, stopwords, error patterns, and dynamic term-importance loader from CSV.gz | Always (imported by analyzers) |
 | `dynamic_script_analysis.py` | Recommended | Builds dynamic term importance data and optional SBERT script embeddings from `Scripts.xlsx` | Run when scripts change |
 | `improved_call_coverage_checker.py` | Yes (for CAN) | Cantonese checker with weighted multi-metric scoring and grouping logic | CAN calls / direct single-file test |
-| `Mandarin/improved_call_coverage_checker_M.py` | Yes (for MAN/ENG) | SBERT-driven checker used in Mandarin/English branch | MAN or ENG calls in batch |
+| `improved_call_coverage_checker_M.py` | Yes (for MAN/ENG) | SBERT-driven checker；与批处理脚本同目录 | MAN or ENG calls in batch |
 | `english_resource.py` | Required for ENG quality | English normalization, synonym expansion, negation handling, fallback resources | ENG calls |
 | `test_eng_integration.py` | Optional but useful | Smoke test for English resource + config + Mandarin analyzer ENG branch | After dependency/environment changes |
 | `generate_presentation_diagrams.py` | Optional | Generates `Presentation_Diagrams.xlsx` docs | Documentation/presentation support |
@@ -111,13 +111,15 @@ An Excel file with two sheets:
    ```
 
 4. **Verify config paths in `config.py`**
+   - `RUN_PROFILE` (1 = INV / 2 = INS) — this is the only switch you should change per run
    - `CONVERTED_TEXT_FOLDER`
    - `FILE_MAPPING_PATH`
-   - `SCRIPT_FILE_PATH`
-   - `OUTPUT_FOLDER`
+   - `SCRIPT_FILE_PATH` (auto-selected by `RUN_PROFILE`)
+   - `OUTPUT_FOLDER` (auto-selected by `RUN_PROFILE`: `./output/INV` or `./output/INS`)
    - `LOG_FILE_PATH`
    - `SBERT_MODEL_PATH`
-   - `SCRIPT_EMBEDDINGS_PATH`
+   - `SCRIPT_EMBEDDINGS_PATH` (auto-selected by `RUN_PROFILE`)
+   - `TERM_IMPORTANCE_CSV` (auto-selected by `RUN_PROFILE`)
 
 ---
 
@@ -127,7 +129,9 @@ An Excel file with two sheets:
 Use this as your default real workflow.
 
 1. **Prepare inputs**
-   - Update/confirm `Scripts.xlsx`
+   - Update/confirm profile-specific script workbook:
+     - `RUN_PROFILE=1` -> `Scripts.xlsx` (investment)
+     - `RUN_PROFILE=2` -> `Scripts_ins.xlsx` (insurance)
    - Ensure `file_mapping.xlsx` and `converted_text/*.csv` are ready
 
 2. **If scripts changed, refresh dynamic resources first**
@@ -136,6 +140,9 @@ Use this as your default real workflow.
    ```
    This updates dynamic term importance (and SBERT script resources) used at runtime.  
    For MAN/ENG, generated script embeddings use `clean_text` keys to match runtime lookup semantics.
+   Profile isolation is automatic:
+   - `RUN_PROFILE=1` -> `term_importance_inv.csv.gz`, `script_embeddings_inv.pkl`
+   - `RUN_PROFILE=2` -> `term_importance_ins.csv.gz`, `script_embeddings_ins.pkl`
 
 3. **Run unified batch entrypoint**
    ```bash
@@ -144,8 +151,8 @@ Use this as your default real workflow.
 
 4. **Language routing inside batch run (important)**
    - `CAN` files -> `improved_call_coverage_checker.py`
-   - `MAN` files -> `Mandarin/improved_call_coverage_checker_M.py`
-   - `ENG` files -> also `Mandarin/improved_call_coverage_checker_M.py` (ENG branch)
+   - `MAN` files -> `improved_call_coverage_checker_M.py`（与 `run_batch_analysis.py` 同目录）
+   - `ENG` files -> 同上（ENG 分支）
 
 5. **Review outputs**
    - Per-call analysis files in `output/`
@@ -200,15 +207,13 @@ So script writing style directly impacts what the model can match.
 
 ### 4) Language-specific scoring engines
 - **CAN (`improved_call_coverage_checker.py`)**
-  - TF-IDF + cosine as main lexical-semantic signal
-  - expanded overlap / fuzzy / keyword coverage as supporting metrics
-- **MAN/ENG (`Mandarin/improved_call_coverage_checker_M.py`)**
-  - SBERT similarity as primary signal
-  - expanded overlap + ROUGE-L + keyword coverage as supporting metrics
-  - embedding cache keys are normalized to `clean_text` (`preprocess_text(..., mode='comparison')`)
-  - runtime SBERT lookup uses the same `clean_text` keys as encoding input, preventing formatting-only cache misses
-  - legacy embedding files are normalized at load time for backward compatibility
-- Final weighted scores use language-specific weights from `config.py`.
+  - Weighted score is a fixed linear mix of four metrics (see **§7**); TF-IDF cosine is the largest term.
+  - Optional **pattern enhancement** (dates/numbers for configured points) can raise the score used for `Covered` vs the raw weighted mix.
+- **MAN/ENG (`improved_call_coverage_checker_M.py`，与批处理同目录）**
+  - Weighted score is a linear mix of four metrics; default weights come from `config.py` → `LANGUAGE_SIMILARITY_WEIGHTS` (see **§7**).
+  - Optional **pattern enhancement** is applied in the pairwise path before comparing to the coverage threshold.
+  - Embedding cache keys are normalized to `clean_text` (`preprocess_text(..., mode='comparison')`).
+  - Legacy embedding pickle keys are normalized at load time for backward compatibility.
 
 ### 5) Script preparation guidance (very important)
 To maximize match quality when preparing `Scripts.xlsx`:
@@ -220,8 +225,57 @@ To maximize match quality when preparing `Scripts.xlsx`:
 - if scripts changed materially, rerun `dynamic_script_analysis.py` before batch run
 
 ### 6) Coverage decision
-- For each required point, best matched group score is compared with threshold.
-- Score >= threshold -> `Covered`; otherwise `Not Covered`.
+- For each required point, the engine picks the **best dialogue group** (highest score after Holistic vs Granular choice and any pattern enhancement).
+- **`Covered`**: that best score **≥** the analyzer threshold (CAN default **0.3** in `check_coverage`; MAN/ENG default **0.4**).
+- **`Not Covered`**: best score **<** threshold.
+- **CAN nuance**: the value compared to the threshold is the **enhanced** score when pattern rules apply (`Weighted_Score` in the row reflects enhancement; `Original_Score` / `Enhancement_Boost` split it for diagnostics).
+
+---
+
+### 7) Weighted score — explicit formulas and one-line metric definitions
+
+All sub-scores below are treated as real numbers in **[0, 1]** before weighting. The **weighted_score** is their weighted sum; it is **not** the same as the `Overlapping_Keywords` column (that column is computed **after** the winner is chosen and is **not** added into the score).
+
+#### Cantonese (CAN) — fixed weights in code
+
+Let **script** be the script-side text (holistic or one variation) and **call** be the grouped dialogue text. After comparison-mode preprocessing:
+
+| Symbol | One-line meaning |
+| --- | --- |
+| **tfidf_cosine** | Cosine similarity between **character n-gram (2–4)** TF-IDF vectors for script vs call, with extra column weights from `current_weights` / tiered rules. |
+| **expanded_similarity** | Overlap of **synonym-expanded** token sets: \|E_script ∩ E_call\| / max(\|E_script\|, \|E_call\|). |
+| **rouge_l** | Token-level **ROUGE-L** F-score (longest common subsequence style) between script and call. |
+| **keyword_coverage** | Share of “script tokens that are also in `dictionaries.important_keywords`” that also appear in call tokens: \|H ∩ K\| / \|K\| with K = (script tokens ∩ `important_keywords`); **0** if K is empty. |
+
+**Formula (CAN):**
+
+`weighted_score = 0.55 * tfidf_cosine + 0.15 * expanded_similarity + 0.20 * rouge_l + 0.10 * keyword_coverage`
+
+Then **pattern enhancement** may add a small boost (capped at 1.0); the **threshold** is applied to that post-enhancement score for `Covered`.
+
+#### Mandarin / English (MAN/ENG) — weights from `config.py`
+
+| Symbol | One-line meaning |
+| --- | --- |
+| **semantic_score** | Cosine similarity between **Sentence-BERT** embeddings of preprocessed script vs call (with optional precomputed embedding caches). |
+| **expanded_similarity** | Overlap of synonym-expanded token sets: \|E_script ∩ E_call\| / \|E_script ∪ E_call\| (**union denominator**, unlike CAN). |
+| **rouge_l** | Same token-level ROUGE-L idea as CAN, on preprocessed script vs call. |
+| **keyword_coverage** | Same definition as CAN: uses **only** `dictionaries.important_keywords` to form K from script tokens (not the dynamic top-term list). |
+
+**Formula (MAN/ENG):** weights are read from `LANGUAGE_SIMILARITY_WEIGHTS` in `config.py` (defaults: SBERT **0.60**, expanded_overlap **0.15**, rouge_l **0.15**, keyword_coverage **0.10**). For example:
+
+`weighted_score = w_SBERT * semantic_score + w_exp * expanded_similarity + w_rouge * rouge_l + w_kw * keyword_coverage`
+
+**Note:** `LANGUAGE_SIMILARITY_WEIGHTS['ENG']` also defines a `fuzzy_similarity` slot, but the current SBERT `calculate_semantic_similarity` implementation does **not** add a separate fuzzy term into this sum.
+
+---
+
+### 8) Dynamic top terms (`dynamic_script_analysis.py`) vs `keyword_coverage`
+
+- **`dynamic_script_analysis.py`** builds per-sheet, per-discussion-point **top terms** and writes them to **`term_importance.csv.gz`** (see `config.TERM_IMPORTANCE_DIR` / `TERM_IMPORTANCE_CSV`). `dictionaries.py` loads this file into an internal structure and exposes **`get_product_weights`** / **`get_point_specific_weights`**.
+- **They are not merged into `keyword_coverage`.** `keyword_coverage` only uses **`dictionaries.important_keywords`** to define K. If K is often empty or tiny because `important_keywords` was never expanded, **`keyword_coverage` contributes little or nothing** even when dynamic top terms exist.
+- **Where top terms *are* used today (CAN path):** for Cantonese, point/product-specific weights from that CSV feed **`current_weights`** and influence **TF-IDF feature weighting** (tiered weighting on char n-grams) during similarity — i.e. they shape **tfidf_cosine**, not the separate `keyword_coverage` ratio.
+- **MAN/ENG main batch path:** `check_coverage` uses **`compute_pairwise_matches`**, which calls **`calculate_semantic_similarity`** without swapping in per-point weights; **`current_weights`** is still loaded at startup but **does not** enter the SBERT + ROUGE + expanded + keyword_coverage formula in that path. So dynamic CSV terms **do not** currently alter the MAN/ENG weighted score components the way they alter CAN TF-IDF.
 
 ---
 
